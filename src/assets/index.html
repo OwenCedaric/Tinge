@@ -41,7 +41,7 @@
             <div class="global-config">
                 <div id="authSection">
                     <span class="config-label">Authentication Access</span>
-                    <input type="password" id="authToken" style="max-width: 100%;" placeholder="Enter Token to Unlock Management" />
+                    <input type="password" id="authToken" style="max-width: 100%;" placeholder="Enter AUTH_TOKEN (Required for Upload & Manage)" />
                 </div>
 
                 <div id="storageSection">
@@ -155,6 +155,9 @@
                 }
             },
             async convertToAvif(file) {
+                if (file.type === 'image/avif' || file.name.toLowerCase().endsWith('.avif')) return file;
+                if (file.type.includes('svg') || file.name.toLowerCase().endsWith('.svg')) return file;
+                if (file.type.includes('gif') || file.name.toLowerCase().endsWith('.gif')) return file;
                 await this.init();
                 const buffer = await file.arrayBuffer();
                 let imageData;
@@ -234,6 +237,36 @@
             }
         }
 
+        function getAuthTokenFromUI() {
+            const input = document.getElementById('authToken');
+            let token = input ? input.value.trim() : '';
+            if (token.toLowerCase().startsWith('bearer ')) {
+                token = token.substring(7).trim();
+                if (input) input.value = token;
+            }
+            if (token) {
+                try { localStorage.setItem('tinge_auth_token', token); } catch(e){}
+            }
+            return token;
+        }
+
+        // Initialize saved auth token from localStorage
+        try {
+            const saved = localStorage.getItem('tinge_auth_token') || localStorage.getItem('ciw_auth_token');
+            const authInput = document.getElementById('authToken');
+            if (saved && authInput) authInput.value = saved;
+            if (authInput) {
+                authInput.addEventListener('input', (e) => {
+                    let val = e.target.value.trim();
+                    if (val.toLowerCase().startsWith('bearer ')) {
+                        val = val.substring(7).trim();
+                        e.target.value = val;
+                    }
+                    try { localStorage.setItem('tinge_auth_token', val); } catch(err){}
+                });
+            }
+        } catch(e){}
+
         function getSelectedStorages() {
             const storages = [];
             if (document.getElementById('targetGithub').checked) storages.push('github');
@@ -251,7 +284,7 @@
             resultsArea.style.display = 'none';
 
             try {
-                const token = document.getElementById('authToken').value.trim();
+                const token = getAuthTokenFromUI();
                 const data = { results: {} };
 
                 if (currentTab === 'url') {
@@ -264,7 +297,13 @@
                         headers: headers,
                         body: JSON.stringify({ urls: lines, storage: storages })
                     });
-                    if (!res.ok) { let msg = `Error ${res.status}`; try { const d = await res.json(); msg = d.error || msg; } catch(e){} throw new Error(msg); }
+                    if (!res.ok) {
+                        let msg = res.status === 401 
+                            ? 'Unauthorized: Please enter a valid AUTH_TOKEN in Authentication Access above.' 
+                            : `Error ${res.status}`;
+                        try { const d = await res.json(); if (d.error && d.error !== 'Unauthorized') msg = d.error; } catch(e){}
+                        throw new Error(msg);
+                    }
                     const resData = await res.json();
                     Object.assign(data.results, resData.results || {});
                 } else if (currentTab === 'upload') {
@@ -274,25 +313,20 @@
                         statusEl.innerText = `Preparing ${file.name}...`;
                         const formData = new FormData();
                         
-                        if (storages.includes('github')) {
-                            formData.append('file', file);
-                            formData.append('storage', 'github');
-                        }
-
+                        // Convert to AVIF on client whenever R2 is a target
                         if (storages.includes('r2')) {
                             statusEl.innerText = `Optimizing ${file.name} to AVIF...`;
                             try {
                                 const avifFile = await window.TingeProcessor.convertToAvif(file);
                                 formData.append('file', avifFile);
-                                if (!formData.has('storage')) formData.append('storage', 'r2');
-                                else formData.set('storage', formData.get('storage') + ',r2');
                             } catch (e) {
-                                console.warn('AVIF Conversion failed, uploading original:', e);
+                                console.warn('Client AVIF conversion fallback to original:', e);
                                 formData.append('file', file);
-                                if (!formData.has('storage')) formData.append('storage', 'r2');
-                                else formData.set('storage', formData.get('storage') + ',r2');
                             }
+                        } else {
+                            formData.append('file', file);
                         }
+                        formData.append('storage', storages.join(','));
 
                         const headers = {};
                         if (token) headers['Authorization'] = `Bearer ${token}`;
@@ -301,7 +335,13 @@
                             headers: headers,
                             body: formData
                         });
-                        if (!res.ok) { let msg = `Error ${res.status}`; try { const d = await res.json(); msg = d.error || msg; } catch(e){} throw new Error(msg); }
+                        if (!res.ok) {
+                            let msg = res.status === 401 
+                                ? 'Unauthorized: Please enter a valid AUTH_TOKEN in Authentication Access above.' 
+                                : `Error ${res.status}`;
+                            try { const d = await res.json(); if (d.error && d.error !== 'Unauthorized') msg = d.error; } catch(e){}
+                            throw new Error(msg);
+                        }
                         const resData = await res.json();
                         Object.assign(data.results, resData.results);
                     }
@@ -340,7 +380,7 @@
         }
 
         async function loadAssets(loadMore = false) {
-            const token = document.getElementById('authToken').value.trim();
+            const token = getAuthTokenFromUI();
             const grid = document.getElementById('assetGrid');
             const countEl = document.getElementById('assetCount');
             const pagination = document.getElementById('pagination');
@@ -351,7 +391,13 @@
                 const headers = {};
                 if (token) headers['Authorization'] = `Bearer ${token}`;
                 const res = await fetch(url, { headers });
-                if (!res.ok) { let msg = `Error ${res.status}`; try { const d = await res.json(); msg = d.error || msg; } catch(e){} throw new Error(msg); }
+                if (!res.ok) {
+                    let msg = res.status === 401 
+                        ? 'Unauthorized: Please enter AUTH_TOKEN above to access R2 assets.' 
+                        : `Error ${res.status}`;
+                    try { const d = await res.json(); if (d.error && d.error !== 'Unauthorized') msg = d.error; } catch(e){}
+                    throw new Error(msg);
+                }
                 const result = await res.json();
                 if (result.status === 'success') {
                     if (!loadMore) grid.innerHTML = '';
@@ -370,12 +416,18 @@
 
         async function deleteAsset(key) {
             if (!confirm(`Delete resource: ${key}?`)) return;
-            const token = document.getElementById('authToken').value.trim();
+            const token = getAuthTokenFromUI();
             const headers = { 'Content-Type': 'application/json' };
             if (token) headers['Authorization'] = `Bearer ${token}`;
             try {
                 const res = await fetch('/api/images', { method: 'DELETE', headers, body: JSON.stringify({ key }) });
-                if (!res.ok) { let msg = `Error ${res.status}`; try { const d = await res.json(); msg = d.error || msg; } catch(e){} throw new Error(msg); }
+                if (!res.ok) {
+                    let msg = res.status === 401 
+                        ? 'Unauthorized: Please enter AUTH_TOKEN above to delete assets.' 
+                        : `Error ${res.status}`;
+                    try { const d = await res.json(); if (d.error && d.error !== 'Unauthorized') msg = d.error; } catch(e){}
+                    throw new Error(msg);
+                }
                 loadAssets();
             } catch (e) { alert(e.message); }
         }

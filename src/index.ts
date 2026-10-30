@@ -1,6 +1,5 @@
 import { Hono } from 'hono'
 import htmlContent from './assets/index.html'
-import { processImageToAvif } from './imageProcessor'
 
 type Bindings = {
     GH_TOKEN: string
@@ -31,13 +30,38 @@ const MINIMAL_ASSETS = {
     },
 };
 
-// Helper: Extract Auth Token
-function getAuthToken(c: any): string | undefined {
-    const authHeader = c.req.header('Authorization');
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-        return authHeader.substring(7);
-    }
-    return undefined;
+// Helper: Extract all candidate Auth Tokens from request
+function extractAuthTokens(c: any): string[] {
+    const tokens: string[] = [];
+
+    const addToken = (raw: string | undefined | null) => {
+        if (!raw) return;
+        // In HTTP, multiple headers with the same name are combined with comma (e.g. "Bearer a, Bearer b")
+        const parts = String(raw).split(',');
+        for (let p of parts) {
+            p = p.trim().replace(/^["']|["']$/g, '').trim();
+            while (p.toLowerCase().startsWith('bearer ')) {
+                p = p.substring(7).trim().replace(/^["']|["']$/g, '').trim();
+            }
+            if (p) tokens.push(p);
+        }
+    };
+
+    addToken(c.req.header('Authorization') || c.req.header('authorization'));
+    addToken(c.req.header('X-Worker-Auth') || c.req.header('x-worker-auth'));
+    addToken(c.req.header('X-Access-Token') || c.req.header('x-access-token'));
+    addToken(c.req.query('token') || c.req.query('auth'));
+
+    return tokens;
+}
+
+// Helper: Verify Authentication
+function isAuthorized(c: any): boolean {
+    const expected = c.env.AUTH_TOKEN ? String(c.env.AUTH_TOKEN).trim() : '';
+    // If no AUTH_TOKEN is configured in Worker environment, allow request
+    if (!expected) return true;
+    const tokens = extractAuthTokens(c);
+    return tokens.includes(expected);
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -135,14 +159,19 @@ function getBaseDomainUrl(cOrEnv: any): string {
     return formatBaseUrl(raw);
 }
 
+function isR2Bucket(val: any): val is R2Bucket {
+    return !!val && typeof val === 'object' && typeof val.put === 'function' && typeof val.get === 'function' && typeof val.list === 'function';
+}
+
 // Helper: Resolve R2 Bucket dynamically
 function getR2Bucket(env: any): R2Bucket | undefined {
-    if (env.R2) return env.R2;
-    if (env.R2_BUCKET) return env.R2_BUCKET;
-    if (env.BUCKET) return env.BUCKET;
+    if (!env) return undefined;
+    if (isR2Bucket(env.R2)) return env.R2;
+    if (isR2Bucket(env.R2_BUCKET)) return env.R2_BUCKET;
+    if (isR2Bucket(env.BUCKET)) return env.BUCKET;
     for (const key of Object.keys(env)) {
         const val = env[key];
-        if (val && typeof val.put === 'function' && typeof val.get === 'function' && typeof val.list === 'function') {
+        if (isR2Bucket(val)) {
             return val as R2Bucket;
         }
     }
@@ -274,8 +303,7 @@ async function batchPushToGitHub(files: GitHubFile[], env: Bindings, commitMessa
 app.get('/', (c) => c.html(renderMinimalUI()))
 
 app.post('/api/upload', async (c) => {
-    const token = getAuthToken(c);
-    if (c.env.AUTH_TOKEN && token !== c.env.AUTH_TOKEN) {
+    if (!isAuthorized(c)) {
         return c.json({ error: 'Unauthorized' }, 401)
     }
 
@@ -313,25 +341,12 @@ app.post('/api/upload', async (c) => {
         const outputUrls: string[] = [];
 
         if (storageTargets.includes('r2') && r2) {
-            let r2Buffer = buffer;
-            let r2Ext = ext;
-            let r2ContentType = file.type || 'application/octet-stream';
-
-            if (!r2ContentType.includes('svg') && r2ContentType.startsWith('image/')) {
-                try {
-                    r2Buffer = await processImageToAvif(buffer, r2ContentType);
-                    r2Ext = '.avif';
-                    r2ContentType = 'image/avif';
-                } catch (e) {
-                    console.error("Image conversion failed, falling back to original:", e);
-                }
-            }
-
-            const r2HashBuffer = await crypto.subtle.digest('SHA-256', r2Buffer);
+            const r2HashBuffer = await crypto.subtle.digest('SHA-256', buffer);
             const r2Hash = Array.from(new Uint8Array(r2HashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16);
-            const key = `${r2Hash}${r2Ext}`;
+            const key = `${r2Hash}${ext}`;
+            const r2ContentType = file.type || getContentTypeFromExtension(filename);
 
-            await r2.put(key, r2Buffer, { httpMetadata: { contentType: r2ContentType } });
+            await r2.put(key, buffer, { httpMetadata: { contentType: r2ContentType } });
             outputUrls.push(`${getBaseDomainUrl(c)}/${key}`);
         }
         
@@ -351,8 +366,7 @@ app.post('/api/upload', async (c) => {
 
 // Remote fetch and upload
 app.post('/api/convert', async (c) => {
-    const token = getAuthToken(c);
-    if (c.env.AUTH_TOKEN && token !== c.env.AUTH_TOKEN) return c.json({ error: 'Unauthorized' }, 401)
+    if (!isAuthorized(c)) return c.json({ error: 'Unauthorized' }, 401)
 
     const { urls, storage } = await c.req.json();
     const storageTargets = Array.isArray(storage) ? storage : [storage];
@@ -380,25 +394,12 @@ app.post('/api/convert', async (c) => {
             const outputUrls: string[] = [];
 
             if (storageTargets.includes('r2') && r2) {
-                let r2Buffer = buffer;
-                let r2Ext = ext;
-                let r2ContentType = contentType || 'application/octet-stream';
-
-                if (!r2ContentType.includes('svg') && r2ContentType.startsWith('image/')) {
-                    try {
-                        r2Buffer = await processImageToAvif(buffer, r2ContentType);
-                        r2Ext = '.avif';
-                        r2ContentType = 'image/avif';
-                    } catch (e) {
-                        console.error("Image conversion failed, falling back to original:", e);
-                    }
-                }
-
-                const r2HashBuffer = await crypto.subtle.digest('SHA-256', r2Buffer);
+                const r2HashBuffer = await crypto.subtle.digest('SHA-256', buffer);
                 const r2Hash = Array.from(new Uint8Array(r2HashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16);
-                const key = `${r2Hash}${r2Ext}`;
+                const key = `${r2Hash}${ext}`;
+                const r2ContentType = contentType || getContentTypeFromExtension(filename);
 
-                await r2.put(key, r2Buffer, { httpMetadata: { contentType: r2ContentType } });
+                await r2.put(key, buffer, { httpMetadata: { contentType: r2ContentType } });
                 outputUrls.push(`${getBaseDomainUrl(c)}/${key}`);
             }
             if (storageTargets.includes('github')) {
@@ -417,8 +418,7 @@ app.post('/api/convert', async (c) => {
 
 // R2 Image Management
 app.get('/api/images', async (c) => {
-    const token = getAuthToken(c);
-    if (c.env.AUTH_TOKEN && token !== c.env.AUTH_TOKEN) return c.json({ error: 'Unauthorized' }, 401)
+    if (!isAuthorized(c)) return c.json({ error: 'Unauthorized' }, 401)
     
     const r2 = getR2Bucket(c.env);
     if (!r2) return c.json({ error: 'R2 storage is not configured or bound' }, 500);
@@ -436,8 +436,7 @@ app.get('/api/images', async (c) => {
 });
 
 app.delete('/api/images', async (c) => {
-    const token = getAuthToken(c);
-    if (c.env.AUTH_TOKEN && token !== c.env.AUTH_TOKEN) return c.json({ error: 'Unauthorized' }, 401)
+    if (!isAuthorized(c)) return c.json({ error: 'Unauthorized' }, 401)
     const r2 = getR2Bucket(c.env);
     if (!r2) return c.json({ error: 'R2 storage is not configured or bound' }, 500);
 
